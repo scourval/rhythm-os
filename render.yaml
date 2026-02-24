@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: rhythm-os-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt && spotdl --download-ffmpeg
+    startCommand: gunicorn server:app
+    envVars:
+      - key: SPOTIFY_CLIENT_ID
+        sync: false
+      - key: SPOTIFY_CLIENT_SECRET
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
