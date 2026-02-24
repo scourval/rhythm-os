@@ -1,6 +1,7 @@
 """
 Rhythm OS — Backend Server
-Downloads Spotify tracks as MP3 using yt-dlp + Invidious fallback.
+Downloads tracks as MP3 using yt-dlp from SoundCloud (no bot detection).
+Falls back to YouTube with android client if SoundCloud doesn't have it.
 """
 
 import os, subprocess, tempfile, threading, time, uuid, shutil
@@ -16,14 +17,6 @@ SPOTIFY_CLIENT_ID     = os.environ.get("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 
 jobs = {}
-
-# Public Invidious instances to try as fallback
-INVIDIOUS_INSTANCES = [
-    "https://inv.nadeko.net",
-    "https://invidious.privacydev.net",
-    "https://yt.artemislena.eu",
-    "https://invidious.fdn.fr",
-]
 
 # ── Spotify helpers ──────────────────────────────────────────────────────────
 def get_spotify_token():
@@ -48,24 +41,33 @@ def get_track_info(spotify_url):
     artist = ", ".join(a["name"] for a in d.get("artists", []))
     return title, artist
 
-# ── Find a video ID via Invidious search ─────────────────────────────────────
-def search_invidious(query):
-    """Try each Invidious instance until we get a video ID."""
-    for instance in INVIDIOUS_INSTANCES:
-        try:
-            r = req.get(f"{instance}/api/v1/search",
-                        params={"q": query, "type": "video", "page": 1},
-                        timeout=8)
-            if r.ok:
-                results = r.json()
-                if results and isinstance(results, list):
-                    vid_id = results[0].get("videoId")
-                    if vid_id:
-                        print(f"[invidious] Found {vid_id} via {instance}")
-                        return vid_id, instance
-        except Exception as e:
-            print(f"[invidious] {instance} failed: {e}")
-    return None, None
+# ── yt-dlp runner ────────────────────────────────────────────────────────────
+def ytdlp_download(url_or_search, tmpdir, extra_args=None):
+    out_tmpl = os.path.join(tmpdir, "%(title)s.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        url_or_search,
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "--audio-quality", "5",
+        "--output", out_tmpl,
+        "--no-playlist",
+        "--max-downloads", "1",
+        "--socket-timeout", "30",
+        "--retries", "2",
+        "--no-warnings",
+    ] + (extra_args or [])
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, cwd=tmpdir)
+    print(f"[yt-dlp {url_or_search[:60]}] rc={result.returncode}")
+    if result.stderr: print(result.stderr[-400:])
+    return result
+
+def find_audio(tmpdir):
+    for ext in ["mp3", "m4a", "opus", "webm", "ogg"]:
+        files = list(Path(tmpdir).rglob(f"*.{ext}"))
+        if files:
+            return files[0]
+    return None
 
 # ── Download worker ──────────────────────────────────────────────────────────
 def run_download(job_id: str, spotify_url: str):
@@ -76,86 +78,62 @@ def run_download(job_id: str, spotify_url: str):
         title, artist = get_track_info(spotify_url)
         if not title:
             job["status"] = "error"
-            job["error"]  = "Could not look up track — check SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in Render environment variables"
+            job["error"]  = "Could not look up track — check SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in Render env vars"
             return
 
-        search_query = f"{artist} - {title}"
-        job["message"] = f"Searching: {artist} – {title}"; job["progress"] = 20
-        print(f"[dl] Searching for: {search_query}")
-
-        # 2. Search Invidious for a video ID
-        vid_id, instance = search_invidious(search_query + " audio")
-        if not vid_id:
-            job["status"] = "error"
-            job["error"]  = "Could not find this track on any Invidious server. Try again later."
-            return
-
-        # 3. Download via Invidious URL (bypasses YouTube bot detection)
-        invidious_url = f"{instance}/watch?v={vid_id}"
-        job["message"] = "Downloading audio…"; job["progress"] = 40
+        query = f"{artist} - {title}"
+        print(f"[dl] {query}")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            out_tmpl = os.path.join(tmpdir, "%(title)s.%(ext)s")
 
-            cmd = [
-                "yt-dlp",
-                invidious_url,
-                "--extract-audio",
-                "--audio-format", "mp3",
-                "--audio-quality", "5",
-                "--output", out_tmpl,
-                "--no-playlist",
-                "--socket-timeout", "30",
-                "--retries", "3",
-                "--no-warnings",
-            ]
-
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=180, cwd=tmpdir
+            # ── Attempt 1: SoundCloud search (no bot detection) ──
+            job["message"] = f"Searching SoundCloud…"; job["progress"] = 25
+            result = ytdlp_download(
+                f"scsearch1:{query}",
+                tmpdir,
+                extra_args=["--default-search", "scsearch"]
             )
+            audio = find_audio(tmpdir)
 
-            print(f"[yt-dlp rc={result.returncode}]")
-            if result.stdout: print(f"[stdout] {result.stdout[-600:]}")
-            if result.stderr: print(f"[stderr] {result.stderr[-600:]}")
-
-            if result.returncode != 0:
-                # Try direct YouTube as last resort (sometimes works)
-                job["message"] = "Retrying via YouTube…"; job["progress"] = 50
-                cmd2 = [
-                    "yt-dlp",
-                    f"https://www.youtube.com/watch?v={vid_id}",
-                    "--extract-audio",
-                    "--audio-format", "mp3",
-                    "--audio-quality", "5",
-                    "--output", out_tmpl,
-                    "--no-playlist",
-                    "--socket-timeout", "30",
-                    "--extractor-args", "youtube:player_client=android",
-                ]
-                result = subprocess.run(
-                    cmd2, capture_output=True, text=True, timeout=180, cwd=tmpdir
+            # ── Attempt 2: YouTube with android player client ──
+            if not audio:
+                job["message"] = "Trying YouTube…"; job["progress"] = 45
+                result = ytdlp_download(
+                    f"ytsearch1:{query} audio",
+                    tmpdir,
+                    extra_args=[
+                        "--extractor-args", "youtube:player_client=android,web",
+                        "--user-agent", "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip",
+                    ]
                 )
-                if result.returncode != 0:
-                    err = (result.stderr or result.stdout or "yt-dlp failed").strip()[-400:]
-                    job["status"] = "error"; job["error"] = err
-                    return
+                audio = find_audio(tmpdir)
 
-            job["message"] = "Finishing up…"; job["progress"] = 85
-
-            audio = (list(Path(tmpdir).rglob("*.mp3")) +
-                     list(Path(tmpdir).rglob("*.m4a")) +
-                     list(Path(tmpdir).rglob("*.opus")))
+            # ── Attempt 3: YouTube Music search ──
+            if not audio:
+                job["message"] = "Trying YouTube Music…"; job["progress"] = 60
+                result = ytdlp_download(
+                    f"https://music.youtube.com/search?q={req.utils.quote(query)}",
+                    tmpdir,
+                    extra_args=[
+                        "--extractor-args", "youtube:player_client=android",
+                        "--default-search", "ytsearch",
+                    ]
+                )
+                audio = find_audio(tmpdir)
 
             if not audio:
+                err = (result.stderr or result.stdout or "All sources failed")[-400:]
                 job["status"] = "error"
-                job["error"]  = "No audio file produced. " + (result.stderr or "")[-200:]
+                job["error"]  = f"Could not download '{query}' from any source.\n\n{err}"
                 return
+
+            job["message"] = "Finishing up…"; job["progress"] = 90
 
             out_dir = Path(tempfile.gettempdir()) / "rhythmos_dl"
             out_dir.mkdir(exist_ok=True)
-            safe = f"{artist} - {title}"[:80].replace("/", "-").replace("\\", "-")
+            safe = query[:80].replace("/", "-").replace("\\", "-")
             dest = out_dir / f"{job_id}.mp3"
-            shutil.copy2(audio[0], dest)
+            shutil.copy2(audio, dest)
 
             job.update({"status": "done", "progress": 100, "message": "Ready",
                         "file_path": str(dest), "filename": f"{safe}.mp3"})
