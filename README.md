@@ -175,3 +175,4 @@ A small % of tracks can't be matched on YouTube. This is normal. The rest of you
 
 **Songs aren't loading / stuck at 0**
 Double-check the `HARDCODED_CLIENT_ID` value in `index.html` — it must exactly match the Client ID shown in your Spotify dashboard.
+# rhythm.os
